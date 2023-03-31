@@ -118,7 +118,8 @@ class FileManager:
             return False
 
         self.logger.info("Recreating symlink point to {}".format(extract_dir))
-        os.remove(self.symlink_path)
+        if Path(self.symlink_path).exists():
+            os.remove(self.symlink_path)
         os.symlink(extract_dir, self.symlink_path)
 
         return True
