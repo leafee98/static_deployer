@@ -15,13 +15,23 @@ a subdirectory to contain other files
 import os
 import tarfile
 import shutil
+from pathlib import Path
 from typing import BinaryIO, Union
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from datetime import datetime
 import argparse
 import logging
 
+class NotSymlinkException(Exception):
+    pass
+class NotDirectoryException(Exception):
+    pass
+
 class FileManager:
+    logger = logging.getLogger("FileManager")
+
+    archive_ext = ".tar.gz"
+
     def __init__(self, archive_dir: str, extract_dir: str, symlink_path: str,
                  keep_archive: int, keep_extract: int, temp_dir: str = "/tmp"):
         self.archive_dir = archive_dir
@@ -33,16 +43,45 @@ class FileManager:
 
         self.temp_dir = temp_dir
 
+        self._check_dirs()
+
+    def _check_dirs(self):
+        def check_dir(path):
+            p = Path(path)
+            if p.exists():
+                if not p.is_dir():
+                    raise NotDirectoryException("{} exists and is not a directory".format(path))
+            else:
+                os.makedirs(path)
+
+        def check_symlink(path):
+            p = Path(path)
+            if p.exists():
+                if not p.is_symlink():
+                    raise NotSymlinkException("{} exists and is not a symlink".format(path))
+            else:
+                check_dir(os.path.dirname(path))
+
+        check_dir(self.archive_dir)
+        check_dir(self.extract_dir)
+        check_dir(self.temp_dir)
+        check_symlink(self.symlink_path)
+
     def _get_archive_name(self) -> str:
         time_str = datetime.now().isoformat(timespec="seconds")
-        return f"archive_{time_str}.tar.gz"
+        return f"archive_{time_str}{self.archive_ext}"
+
+    def _get_basename(self, filename: str) -> str:
+        if filename.endswith(self.archive_ext):
+            return filename[:-len(self.archive_ext)]
+        return filename
 
     def _extract(self, archive_path: str, target_path: str) -> bool:
         try:
             with tarfile.open(archive_path, mode="r:gz") as tf:
                 tf.extractall(target_path)
         except Exception as e:
-            logging.error("Failed to extract tar file: {}".format(e))
+            self.logger.error("Failed to extract tar file: {}".format(e))
             return False
         return True
 
@@ -51,7 +90,7 @@ class FileManager:
         archive_name = self._get_archive_name()
         tgt_file = os.path.join(self.temp_dir, archive_name)
 
-        logging.info("Saving to {}".format(tgt_file))
+        self.logger.info("Temporarily save to {}".format(tgt_file))
 
         try:
             f = open(tgt_file, "bw")
@@ -62,18 +101,23 @@ class FileManager:
             return None
 
         final_file = os.path.join(self.archive_dir, archive_name)
+        self.logger.info("Moving saved archive to {}".format(final_file))
         shutil.move(tgt_file, final_file)
         return final_file
 
     def deploy(self, archive_path: str) -> bool:
-        extract_dir = os.path.join(self.extract_dir, os.path.basename(archive_path))
+        extract_dir = os.path.join(self.extract_dir,
+                                   self._get_basename(os.path.basename(archive_path)))
 
-        logging.info("Deploying to {}".format(extract_dir))
+        self.logger.info("Extracting to {}".format(extract_dir))
 
         os.mkdir(extract_dir)
         if not self._extract(archive_path, extract_dir):
+            self.logger.error("Failed to extract archive {} to {}"
+                              .format(archive_path, extract_dir))
             return False
 
+        self.logger.info("Recreating symlink point to {}".format(extract_dir))
         os.remove(self.symlink_path)
         os.symlink(extract_dir, self.symlink_path)
 
@@ -85,7 +129,7 @@ class FileManager:
         for f in files[:-keep_count]:
             full_path = os.path.join(dirname, f)
 
-            logging.info("Removing {}".format(full_path))
+            self.logger.info("Removing {}".format(full_path))
             if rm_dir:
                 shutil.rmtree(full_path)
             else:
@@ -93,21 +137,23 @@ class FileManager:
 
     def vacuum(self) -> None:
         if self.keep_archive > 0:
-            logging.info("Vacuuming archive, keep {} finally".format(self.keep_archive))
+            self.logger.info("Vacuuming archive, keep the {} lastest".format(self.keep_archive))
             self._vacuum_single(self.archive_dir, self.keep_archive, False)
         if self.keep_extract > 0:
-            logging.info("Vacuuming extract, keep {} finally".format(self.keep_extract))
+            self.logger.info("Vacuuming extract, keep the {} lastest".format(self.keep_extract))
             self._vacuum_single(self.extract_dir, self.keep_extract, True)
 
     def handle(self, instream: BinaryIO, content_length: int) -> bool:
         archive_path = self.save_file(instream, content_length)
         if archive_path is None:
-            logging.error("Failed to extract file. Aborted!")
+            self.logger.error("Failed to save file. Aborted!")
             return False
 
         if not self.deploy(archive_path):
+            self.logger.error("Failed to extract or create symlink. Aborted!")
             return False
         self.vacuum()
+        self.logger.info("Deploy success")
         return True
 
 global_mgr: FileManager
@@ -128,6 +174,7 @@ def redirect_stream(src: BinaryIO, tgt: BinaryIO, size: int) -> None:
 
 class S(BaseHTTPRequestHandler):
     protocol_version = 'HTTP/1.1'
+    logger = logging.getLogger("HttpHandler")
 
     def __init__(self, *args, **kwargs):
         super(S, self).__init__(*args, **kwargs)
@@ -138,7 +185,7 @@ class S(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
-        logging.info("Received GET request, Path: %s", str(self.path))
+        self.logger.info("Received GET request, Path: %s", str(self.path))
         content = "Non-implemented".encode("utf-8")
         self._write_response(403, "text/plaintext", content)
 
@@ -155,11 +202,9 @@ class S(BaseHTTPRequestHandler):
         if global_mgr.handle(self.rfile, content_length):
             content = "Success".encode("utf-8")
             self._write_response(200, "text/plaintext", content)
-            logging.info("Deploy success")
         else:
             content = "Failed".encode("utf-8")
             self._write_response(200, "text/plaintext", content)
-            logging.error("Deploy failed")
         self.wfile.flush()
 
 
