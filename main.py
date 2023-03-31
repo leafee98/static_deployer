@@ -137,10 +137,10 @@ class S(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "text/plaintext")
         self.end_headers()
 
-    # def do_GET(self):
-    #     logging.info("GET request, Path=%s, Headers: %s", str(self.path), str(self.headers))
-    #     self._set_response()
-    #     self.wfile.write("GET request for {}".format(self.path).encode("utf-8"))
+    def do_GET(self):
+        logging.info("Received GET request, Path: %s", str(self.path))
+        content = "Non-implemented".encode("utf-8")
+        self._write_response(403, "text/plaintext", content)
 
     def _write_response(self, status_code: int, content_type: str, content: bytes):
             self.send_response(status_code)
